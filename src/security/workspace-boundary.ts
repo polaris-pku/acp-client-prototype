@@ -4,17 +4,29 @@ import { PermissionDeniedError } from "../core/errors.js";
 
 export class WorkspaceBoundary {
   readonly root: string;
-  private readonly realRoot: Promise<string>;
+  private realRootPromise: Promise<string> | undefined;
 
   constructor(root: string) {
     this.root = path.resolve(root);
-    this.realRoot = fs.realpath(this.root);
+  }
+
+  /**
+   * 沙箱根的真实路径，惰性求值且只求一次。
+   *
+   * 不能在构造函数里直接发起 `fs.realpath()`：那个 promise 在调用方 await 它之前就
+   * 可能 reject（根目录不存在时便是如此），成为 unhandled rejection 直接终止进程。
+   * 那会让驱动在写出任何结果之前就死掉，把一次本可归因的失败变成无结构的崩溃。
+   * 惰性化之后，拒绝由真正 await 它的调用方接管，错误沿调用栈正常上抛。
+   */
+  private realRoot(): Promise<string> {
+    this.realRootPromise ??= fs.realpath(this.root);
+    return this.realRootPromise;
   }
 
   async resolveExisting(candidate: string): Promise<string> {
     const resolved = this.resolveLexically(candidate);
     const realPath = await fs.realpath(resolved);
-    this.assertInside(await this.realRoot, realPath, candidate);
+    this.assertInside(await this.realRoot(), realPath, candidate);
     return resolved;
   }
 
@@ -22,7 +34,7 @@ export class WorkspaceBoundary {
     const resolved = this.resolveLexically(candidate);
     const existingAncestor = await this.findExistingAncestor(resolved);
     const realAncestor = await fs.realpath(existingAncestor);
-    this.assertInside(await this.realRoot, realAncestor, candidate);
+    this.assertInside(await this.realRoot(), realAncestor, candidate);
     return resolved;
   }
 
