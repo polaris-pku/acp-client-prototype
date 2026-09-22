@@ -355,6 +355,32 @@ pnpm run build:test
 node dist/tests/driver.test.js
 ```
 
+#### Cold-start phase marks (`driver.phase`)
+
+A driver invocation's lifecycle cannot be split from the outside, so the runner emits paired
+`driver.phase` events on the reserved audit channel (stderr lines prefixed with
+`NEWIDE_DRIVER_EVENT`) for upper layers to attribute time against:
+
+| `payload.phase` | Covers                                                      |
+| --------------- | ----------------------------------------------------------- |
+| `initialize`    | ACP initialize handshake                                    |
+| `authenticate`  | Credential resolution and authentication                    |
+| `session`       | Session creation or load; `payload.mode` is `create`/`load` |
+| `shutdown`      | Connection and child-process teardown                       |
+
+Contract:
+
+- Each phase emits `boundary: "started"`, then `boundary: "completed"`. **Failures also emit
+  completed**, carrying `ok: false` and `error`, so consumers close a phase unconditionally
+  without branching.
+- The envelope's `created_at` is this process's wall clock; `sequence` totally orders events
+  within one turn.
+- This is a **cross-repository contract**: `CommandDriverTransport` in `newide-scaffold` opens
+  and closes `driver.<phase>` latency spans from these phase names. Renaming requires changing
+  both sides.
+- `spawn`, first output, and process exit are deliberately absent — they happen outside or after
+  the ACP process, so the transport times them locally.
+
 ---
 
 ---

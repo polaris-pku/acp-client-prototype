@@ -346,6 +346,28 @@ pnpm run build:test
 node dist/tests/driver.test.js
 ```
 
+#### 冷启动分段埋点（`driver.phase`）
+
+一次驱动调用的生命周期从外部无法拆分，因此 runner 会在保留审计通道（stderr 上以
+`NEWIDE_DRIVER_EVENT` 为前缀的行）成对发出 `driver.phase` 事件，供上层做耗时归因：
+
+| `payload.phase` | 覆盖范围                                            |
+| --------------- | --------------------------------------------------- |
+| `initialize`    | ACP 初始化握手                                      |
+| `authenticate`  | 凭据解析与认证                                      |
+| `session`       | 会话创建或加载；`payload.mode` 为 `create` / `load` |
+| `shutdown`      | 连接与子进程收尾                                    |
+
+约定：
+
+- 每段先发 `boundary: "started"`，再发 `boundary: "completed"`；**失败同样发 completed**，
+  带 `ok: false` 与 `error`。上层关闭埋点的逻辑因此无条件、无分支。
+- 信封里的 `created_at` 是本进程墙钟，`sequence` 保证同一 turn 内全序。
+- 这是**跨仓库契约**：`newide-scaffold` 的 `CommandDriverTransport` 按这些段名开闭
+  `driver.<phase>` 耗时 span，改名必须两侧同时改。
+- `spawn`、首个输出、进程退出不在表中——它们发生在 ACP 进程之外或之后，由 transport
+  侧自行计时。
+
 ---
 
 ---
