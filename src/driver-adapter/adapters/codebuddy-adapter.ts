@@ -15,5 +15,11 @@ export class CodebuddyAdapter extends BaseAdapter {
         TENCENT_API_KEY: "tencent-api-key",
       }
     );
+    // 该包声明了 codebuddy / cbc / cbc-prewarm 三个 bin，必须指名。
+    this.localLaunch = {
+      packageName: "@tencent-ai/codebuddy-code",
+      binName: "codebuddy",
+      args: ["--acp"],
+    };
   }
 }

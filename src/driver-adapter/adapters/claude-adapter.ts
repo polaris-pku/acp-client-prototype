@@ -14,5 +14,6 @@ export class ClaudeAdapter extends BaseAdapter {
         ANTHROPIC_API_KEY: "anthropic-api-key",
       }
     );
+    this.localLaunch = { packageName: "@agentclientprotocol/claude-agent-acp", args: ["acp"] };
   }
 }
