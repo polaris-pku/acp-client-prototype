@@ -14,5 +14,6 @@ export class OpencodeAdapter extends BaseAdapter {
         OPENCODE_CONFIG: "opencode-config",
       }
     );
+    this.localLaunch = { packageName: "opencode-ai", args: ["acp"] };
   }
 }

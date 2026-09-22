@@ -16,5 +16,6 @@ export class CopilotAdapter extends BaseAdapter {
         GITHUB_TOKEN: "github-token",
       }
     );
+    this.localLaunch = { packageName: "@github/copilot", args: ["--acp"] };
   }
 }
