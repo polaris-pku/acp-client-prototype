@@ -1,4 +1,4 @@
-import { closeSync, openSync, readFileSync, readSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
@@ -95,7 +95,16 @@ function resolveEntry(packageJsonPath: string, spec: LocalLaunchSpec): string | 
     verbose(`${spec.packageName} 未声明可用的 bin 入口，回退 npx`);
     return undefined;
   }
-  return path.resolve(path.dirname(packageJsonPath), relative);
+
+  const absolute = path.resolve(path.dirname(packageJsonPath), relative);
+  // 声明的入口未必真的落地：平台二进制靠 optionalDependencies 提供、或安装时
+  // 跳过了构建脚本（--ignore-scripts）都会留下空路径。不查存在性的话，回退到
+  // npx 的保护就形同虚设——会 spawn 一个不存在的文件，报一个难查的 ENOENT。
+  if (!existsSync(absolute)) {
+    verbose(`${spec.packageName} 声明的入口不存在（${relative}），回退 npx`);
+    return undefined;
+  }
+  return absolute;
 }
 
 /**

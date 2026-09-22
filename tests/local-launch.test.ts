@@ -1,4 +1,6 @@
 import { strict as assert } from "node:assert";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { BaseAdapter } from "../src/driver-adapter/base-adapter.js";
@@ -60,6 +62,25 @@ test("executes a native binary entry directly instead of wrapping it in node", (
   assert.notEqual(resolved.command, process.execPath);
   assert.match(resolved.command, /opencode\.exe$/i);
   assert.deepEqual(resolved.args, ["acp"]);
+});
+
+test("falls back to npx when the declared entry point is not on disk", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acp-local-launch-"));
+  try {
+    await fs.writeFile(
+      path.join(dir, "package.json"),
+      JSON.stringify({ name: "fake-agent", bin: { "fake-agent": "./bin/missing.js" } })
+    );
+    // packageName 写成目录绝对路径：require.resolve 会直接采用它，于是不必伪造一套
+    // node_modules 布局，就能覆盖「声明了 bin 但文件没落地」这条真实存在的路径。
+    assert.equal(
+      resolveLocalLaunch({ packageName: dir, args: [] }),
+      undefined,
+      "入口不存在时必须放弃解析，否则回退保护形同虚设"
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("falls back to the npx command when the package cannot be resolved", () => {
