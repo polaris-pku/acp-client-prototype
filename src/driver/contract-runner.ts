@@ -22,6 +22,18 @@ import type {
 const DRIVER_EVENT_PREFIX = "NEWIDE_DRIVER_EVENT ";
 const DRIVER_EVENT_SCHEMA_VERSION = "driver-event.v1";
 
+/**
+ * `driver.phase` 事件携带的段名闭集。
+ *
+ * 这是**跨仓库契约**：newide-scaffold 的 CommandDriverTransport 按这些名字开/闭
+ * `driver.<phase>` 的耗时埋点。改这里的字面量等于改契约，两边必须同时改。
+ *
+ * 只登记驱动调用内部、从外部观测不到的段。spawn、首个输出、以及进程退出
+ * （cleanup）发生在 ACP 进程之外或之后，由 transport 侧自行计时，不在此重复；
+ * prompt / turn 已由既有的 driver.turn_started / turn_completed 覆盖。
+ */
+type DriverPhase = "initialize" | "authenticate" | "session" | "shutdown";
+
 interface RunOptions {
   agentId: string;
   workspace: string;
@@ -128,22 +140,60 @@ async function runContractPrompt(
     }
   };
 
+  /**
+   * 包住一个冷启动阶段，成对发 driver.phase 的 started / completed。
+   *
+   * 失败也发 completed（带 `ok: false` 与错误摘要），而不是另发一条 failed：
+   * transport 侧关闭埋点的逻辑因此无条件、无分支；而且「这一段花了多久才失败」
+   * 本身正是失败归因需要的数据。
+   *
+   * 固定字段写在 `...meta` 之后，保证 meta 覆盖不掉 phase / boundary / ok。
+   */
+  const runPhase = async <T>(
+    phase: DriverPhase,
+    meta: Record<string, unknown>,
+    run: () => Promise<T>
+  ): Promise<T> => {
+    emitDriverEvent("driver.phase", { ...meta, phase, boundary: "started" });
+    try {
+      const value = await run();
+      emitDriverEvent("driver.phase", { ...meta, phase, boundary: "completed", ok: true });
+      return value;
+    } catch (error) {
+      emitDriverEvent("driver.phase", {
+        ...meta,
+        phase,
+        boundary: "completed",
+        ok: false,
+        error: errorMessage(error),
+      });
+      throw error;
+    }
+  };
+
   try {
-    client = new AcpClientBuilder()
+    // 先落到 const：闭包里要用到收窄后的类型，而外层 `client` 只留给 finally 收尾。
+    const acpClient = new AcpClientBuilder()
       .withAgent(options.agentId)
       .withVerbose(false)
       .withAutoApprove(process.env.AUTO_APPROVE === "1")
       .withSandboxDir(workspace)
       .build();
+    client = acpClient;
 
-    await client.initialize();
-    await client.authenticate();
+    await runPhase("initialize", {}, () => acpClient.initialize());
+    await runPhase("authenticate", {}, () => acpClient.authenticate());
 
     const mcpServers = input.mcp_servers ?? [];
 
-    const session = input.session_id
-      ? await client.loadSession(input.session_id, workspace, mcpServers)
-      : await client.createSession(workspace, mcpServers);
+    // create 与 load 的成本形态不同（load 要重放历史），而是否复用会话正是本次
+    // 归因要回答的问题之一，所以用 meta.mode 而不是拆成两个段名。
+    const sessionMode = input.session_id ? "load" : "create";
+    const session = await runPhase("session", { mode: sessionMode }, () =>
+      input.session_id
+        ? acpClient.loadSession(input.session_id, workspace, mcpServers)
+        : acpClient.createSession(workspace, mcpServers)
+    );
     sessionId = session.sessionId;
     emitDriverEvent("driver.turn_started", { prompt_length: input.prompt.length });
 
@@ -223,9 +273,10 @@ async function runContractPrompt(
       process.removeListener("SIGTERM", onTerminate);
       process.removeListener("SIGINT", onTerminate);
     }
-    if (client) {
+    const closing = client;
+    if (closing) {
       try {
-        await client.shutdown();
+        await runPhase("shutdown", {}, () => closing.shutdown());
       } catch (shutdownError) {
         process.stderr.write(`[driver:run] shutdown failed: ${errorMessage(shutdownError)}\n`);
       }
