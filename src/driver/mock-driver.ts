@@ -533,6 +533,7 @@ export function runAcpMockServer() {
                 title: "Update generated session file",
                 kind: "edit",
                 status: "in_progress",
+                locations: [{ path: "generated/session.txt" }],
               },
             });
             await conn.sessionUpdate({
@@ -617,6 +618,14 @@ export function runAcpMockServer() {
 
         return {
           stopReason: "done",
+          // 覆盖 PromptResponse.usage 的透传路径。thoughtTokens 故意不给，
+          // 用来验证可选项缺席时不会补零。
+          usage: {
+            totalTokens: 30,
+            inputTokens: 20,
+            outputTokens: 10,
+            cachedReadTokens: 5,
+          },
         };
       },
       cancel: async () => {

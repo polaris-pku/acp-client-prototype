@@ -80,6 +80,8 @@ export type {
   ToolCallUpdate,
   ToolCallUpdateUpdate,
   ToolContent,
+  ToolKind,
+  UsageUpdate,
   UserMessageChunkUpdate,
 } from "./core/types.js";
 export * from "./core/errors.js";
