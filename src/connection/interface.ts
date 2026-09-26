@@ -31,6 +31,7 @@ export interface SessionRecord {
 
 export interface ConnectionEvent {
   type:
+    | "user_message_chunk"
     | "agent_message_chunk"
     | "agent_thought_chunk"
     | "tool_call"
@@ -40,6 +41,7 @@ export interface ConnectionEvent {
     | "current_mode_update"
     | "config_option_update"
     | "session_info_update"
+    | "usage_update"
     | "permission_request"
     | "disconnect"
     | "stderr";

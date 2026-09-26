@@ -322,3 +322,74 @@ test("driver contract runner marks a resumed session as mode=load", () => {
   );
   assert.equal(sessionStarted?.payload?.mode, "load");
 });
+
+test("driver contract runner passes PromptResponse.usage through as snake_case", () => {
+  const prompt = {
+    task_id: "task-contract-usage",
+    run_id: "run-contract-usage",
+    prompt: "Say hello so the default path reports usage.",
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "mock-driver",
+      ACP_WORKSPACE: process.cwd(),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.deepEqual(parsed.usage, {
+    total_tokens: 30,
+    input_tokens: 20,
+    output_tokens: 10,
+    cached_read_tokens: 5,
+  });
+  // 协议里缺省的可选项不补零：「没有这个数据」与「用了 0 个」是不同的信号。
+  assert.equal("thought_tokens" in parsed.usage, false);
+  assert.equal("cached_write_tokens" in parsed.usage, false);
+});
+
+test("driver contract runner retains tool kind and locations on tool_events", () => {
+  const prompt = {
+    task_id: "task-contract-tool-detail",
+    run_id: "run-contract-tool-detail",
+    session_id: "existing-session-id",
+    workspace_path: process.cwd(),
+    prompt: "Continue session and update the generated file.",
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "mock-driver",
+      ACP_WORKSPACE: process.cwd(),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  const write = parsed.tool_events.find(
+    (event: { tool_event_id: string }) => event.tool_event_id === "mock-session-write"
+  );
+  assert.ok(write, "expected the mock session-write tool event");
+  // kind 是分类，与 tool_name（当前由 kind 顶替）并存，供消费方自行降级。
+  assert.equal(write.kind, "edit");
+  // 原样透传 agent 上报的路径，不做归一化——消费方按自己的沙箱根去解释。
+  assert.deepEqual(write.locations, ["generated/session.txt"]);
+});

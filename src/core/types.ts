@@ -181,7 +181,8 @@ export type SessionUpdate =
   | AvailableCommandsUpdate
   | CurrentModeUpdate
   | ConfigOptionUpdate
-  | SessionInfoUpdate;
+  | SessionInfoUpdate
+  | UsageUpdate;
 
 export interface UserMessageChunkUpdate {
   sessionUpdate: "user_message_chunk";
@@ -198,11 +199,30 @@ export interface AgentThoughtChunkUpdate {
   content: ContentBlock;
 }
 
+/**
+ * 工具类别，取自 ACP 的 `ToolKind`。
+ *
+ * 这是**分类**不是工具名：`execute` 既可能是 Bash 也可能是 PowerShell。
+ * 真正的工具名在 adapter 的 `_meta` 里（如 claude 的 `_meta.claudeCode.toolName`），
+ * 不属于协议标准字段，所以不能拿 kind 当名字用。
+ */
+export type ToolKind =
+  | "read"
+  | "edit"
+  | "delete"
+  | "move"
+  | "search"
+  | "execute"
+  | "think"
+  | "fetch"
+  | "switch_mode"
+  | "other";
+
 export interface ToolCallUpdate {
   sessionUpdate: "tool_call";
   toolCallId: string;
   title: string;
-  kind: string;
+  kind: ToolKind;
   status: "pending" | "in_progress";
   rawInput?: unknown;
   locations?: FileLocation[];
@@ -263,6 +283,22 @@ export interface SessionInfoUpdate {
   sessionUpdate: "session_info_update";
   title?: string;
   updatedAt?: string;
+}
+
+/**
+ * 会话级上下文水位与累积成本。
+ *
+ * 协议标注 **UNSTABLE**：不属于正式规范，随时可能改。用作观测可以，
+ * 不要当成稳定契约来依赖。
+ */
+export interface UsageUpdate {
+  sessionUpdate: "usage_update";
+  /** 当前上下文里的 token 数。 */
+  used: number;
+  /** 上下文窗口总容量（token）。 */
+  size: number;
+  /** 会话累积成本。实测 adapter 未必每条都带。 */
+  cost?: { amount: number; currency: string };
 }
 
 // ── Permission ──

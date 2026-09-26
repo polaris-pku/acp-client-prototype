@@ -10,6 +10,7 @@ import {
   nowTimestamp,
   type ArtifactRef,
   type McpServerConfig,
+  type ToolKind,
 } from "../core/types.js";
 import type { ConnectionEvent, TurnController } from "../connection/interface.js";
 import type {
@@ -17,6 +18,7 @@ import type {
   DriverRunResult,
   DriverRunStatus,
   DriverToolEvent,
+  DriverUsage,
 } from "./interface.js";
 
 const DRIVER_EVENT_PREFIX = "NEWIDE_DRIVER_EVENT ";
@@ -304,6 +306,7 @@ function buildRunResult(params: ResultBuildInput): DriverRunResult {
   const status = mapRunStatus(stopReason, params.error, params.cancelRequested);
   const error = buildDriverError(status, stopReason, params.error);
   const transcriptStats = summarizeTranscript(params.events);
+  const usage = usageFrom(params.promptResult);
 
   return {
     driver_run_result_id: createId("driver_result"),
@@ -336,6 +339,7 @@ function buildRunResult(params: ResultBuildInput): DriverRunResult {
       schema_version: schemaVersion,
     },
     tool_events: collectToolEvents(params.events, createdAt, schemaVersion),
+    ...(usage ? { usage } : {}),
     diagnostics: {
       driver_id: params.agentId,
       duration_ms: Math.max(0, Date.now() - params.startedAtMs),
@@ -363,6 +367,7 @@ function collectToolEvents(
         tool_name: stringValue(update.kind) || stringValue(update.title) || "tool_call",
         status: normalizeToolStatus(update.status),
         summary: stringValue(update.title) || "ACP tool call started.",
+        ...toolDetail(update),
         created_at: createdAt,
         schema_version: schemaVersion,
       });
@@ -372,11 +377,17 @@ function collectToolEvents(
       const update = updateRecord(event);
       const id = stringValue(update.toolCallId) || createId("tool_event");
       const existing = byId.get(id);
+      // 部分更新只带变化字段，所以 kind / locations 要叠加到已有值上，不能整体覆盖。
+      const detail = toolDetail(update);
+      const kind = detail.kind ?? existing?.kind;
+      const locations = mergeLocationPaths(existing?.locations, detail.locations);
       byId.set(id, {
         tool_event_id: id,
         tool_name: existing?.tool_name || "tool_call",
         status: normalizeToolStatus(update.status),
         summary: summarizeToolUpdate(update, existing),
+        ...(kind ? { kind } : {}),
+        ...(locations ? { locations } : {}),
         created_at: existing?.created_at || createdAt,
         schema_version: schemaVersion,
       });
@@ -566,6 +577,89 @@ function summarizeToolUpdate(update: Record<string, unknown>, existing?: DriverT
   return existing?.summary || "ACP tool call updated.";
 }
 
+/** 协议定义的 kind 闭集。协议外的取值一律丢弃，不把脏值写进契约。 */
+const TOOL_KINDS: readonly string[] = [
+  "read",
+  "edit",
+  "delete",
+  "move",
+  "search",
+  "execute",
+  "think",
+  "fetch",
+  "switch_mode",
+  "other",
+];
+
+/**
+ * 从一次 tool_call / tool_call_update 里取 `kind` 与 `locations`。
+ *
+ * `tool_call_update` 是部分更新——只带变化字段，所以两者都可能缺席，
+ * 调用方需要把结果叠加到已有值上而不是整体替换。
+ */
+function toolDetail(update: Record<string, unknown>): {
+  kind?: ToolKind;
+  locations?: string[];
+} {
+  const rawKind = stringValue(update.kind);
+  const kind = rawKind && TOOL_KINDS.includes(rawKind) ? (rawKind as ToolKind) : undefined;
+  const locations = locationPaths(update);
+  return {
+    ...(kind ? { kind } : {}),
+    ...(locations.length ? { locations } : {}),
+  };
+}
+
+function locationPaths(update: Record<string, unknown>): string[] {
+  const locations = update.locations;
+  if (!Array.isArray(locations)) return [];
+  return locations
+    .map((item) => (isRecord(item) ? stringValue(item.path) : undefined))
+    .filter((path): path is string => path !== undefined);
+}
+
+/** 并集去重且保序（先已有、后新增）：同一次工具调用会在多条更新里重复上报同一路径。 */
+function mergeLocationPaths(
+  existing: string[] | undefined,
+  incoming: string[] | undefined
+): string[] | undefined {
+  const merged = [...new Set([...(existing ?? []), ...(incoming ?? [])])];
+  return merged.length ? merged : undefined;
+}
+
+/**
+ * 从 `PromptResponse.usage` 取本轮 token 用量。
+ *
+ * 协议整体标 UNSTABLE 且 usage 本身可选，所以数据不全时返回 undefined 而不是补零——
+ * 「没有这个数据」和「用了 0 个 token」对下游是不同的信号。
+ */
+function usageFrom(promptResult: unknown): DriverUsage | undefined {
+  if (!isRecord(promptResult)) return undefined;
+  const usage = promptResult.usage;
+  if (!isRecord(usage)) return undefined;
+
+  const totalTokens = numberValue(usage.totalTokens);
+  const inputTokens = numberValue(usage.inputTokens);
+  const outputTokens = numberValue(usage.outputTokens);
+  // 三个必填项缺一不可：缺了就不是一份可用的用量报告。
+  if (totalTokens === undefined || inputTokens === undefined || outputTokens === undefined) {
+    return undefined;
+  }
+
+  const thoughtTokens = numberValue(usage.thoughtTokens);
+  const cachedReadTokens = numberValue(usage.cachedReadTokens);
+  const cachedWriteTokens = numberValue(usage.cachedWriteTokens);
+
+  return {
+    total_tokens: totalTokens,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    ...(thoughtTokens !== undefined ? { thought_tokens: thoughtTokens } : {}),
+    ...(cachedReadTokens !== undefined ? { cached_read_tokens: cachedReadTokens } : {}),
+    ...(cachedWriteTokens !== undefined ? { cached_write_tokens: cachedWriteTokens } : {}),
+  };
+}
+
 function textFromContent(content: unknown): string {
   if (!isRecord(content)) return "";
   return stringValue(content.text) || "";
@@ -582,6 +676,11 @@ function payloadRecord(event: ConnectionEvent): Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+/** 只认有限数值：NaN / Infinity 经 JSON 往返会变成 null，不如在这里就挡掉。 */
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
