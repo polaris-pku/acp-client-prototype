@@ -22,10 +22,15 @@
 
 ## 快速开始
 
+### 0. 环境要求
+
+- Node.js `>=22.22.1`
+- pnpm `>=11.8.0`
+
 ### 1. 安装依赖
 
 ```bash
-npm install
+pnpm install
 ```
 
 ### 2. 配置凭证
@@ -38,7 +43,7 @@ cp .env.example .env
 ### 3. 运行隔离的集成测试
 
 ```bash
-npm run hello -- gemini "Hello World"
+pnpm hello gemini "Hello World"
 ```
 
 ---
@@ -63,6 +68,64 @@ const builder = new AcpClientBuilder()
 const client = builder.build();
 ```
 
+#### Public API Surface
+
+上层集成代码应优先从 package root 导入扩展契约，而不是依赖内部源码路径：
+
+```typescript
+import {
+  AcpClientBuilder,
+  ClientMethodHandler,
+  ClientMethodRouter,
+  AgentConnection,
+  AgentAdapter,
+  AuthExecutor,
+  SessionManager,
+  PtyOutputParser,
+  ClientCapabilities,
+  McpServerConfig,
+} from "acp-client-prototype";
+```
+
+root export 按稳定集成点组织：
+
+| 分类              | 公开导出                                                                                             |
+| ----------------- | ---------------------------------------------------------------------------------------------------- |
+| Client 构建       | `AcpClientBuilder`, `AcpClient`, `AcpClientOptions`, `ConnectionFactory`                             |
+| Method handling   | `ClientMethodHandler`, `ClientMethodRouter`, `ExtensionMethod`, `loadExtensionConfig`                |
+| 默认本地 handler  | `FileSystemHandler`, `PermissionHandler`, `TerminalHandler`, `TerminalHandlerOptions`                |
+| Connection 扩展   | `AgentConnection`, `ConnectionEvent`, `TurnController`, `AcpConnection`, `PtyConnection`             |
+| Adapter 扩展      | `AgentAdapter`, `ADAPTER_REGISTRY`                                                                   |
+| Auth/session 扩展 | `AuthExecutor`, `AuthLayer`, `SessionManager`, `MemorySessionStore`                                  |
+| PTY parser 扩展   | `PtyOutputParser`, `PtyParserContext`, `DefaultPtyParser`, `AiderPtyParser`                          |
+| 协议类型          | `ClientCapabilities`, `McpServerConfig`, `SessionNotification`, `ToolCallUpdate` 及相关 ACP 数据类型 |
+
+extension MCP server 内部实现、私有 parser helper 等实现细节不属于 root public API。
+
+#### Client Method Routing Policy
+
+`AcpClientBuilder` 会在 connection 被使用前安装 `ClientMethodRouter`。如果上层直接构造 `AcpConnection`，必须先调用 `setMethodRouter(...)`，再允许 ACP agent 调用 client methods。缺少 router 或缺少 handler 时会直接失败；connection 不会返回文件、权限、终端或扩展方法的 stub 结果。
+
+在生产集成中，项目内置的 handler、auth、session、connection 都只是默认实现。上层 orchestrator/coordinator 可以在构建阶段替换方法处理器、认证执行器、会话管理器或底层连接：
+
+```typescript
+import { AcpClientBuilder, ClientMethodRouter } from "acp-client-prototype";
+
+const methodRouter = new ClientMethodRouter();
+methodRouter.register("custom/audit", new AuditHandler());
+
+const client = new AcpClientBuilder()
+  .withAgent("gemini")
+  .withFileSystemHandler(new CoordinatorFileSystemHandler())
+  .withPermissionHandler(new CoordinatorPermissionHandler())
+  .withTerminalHandler(new RemoteTerminalHandler())
+  .withMethodRouter(methodRouter)
+  .withAuthLayer(new CoordinatorAuthLayer())
+  .withSessionManager(new PersistentSessionManager())
+  .withConnectionFactory((adapter) => createObservedConnection(adapter))
+  .build();
+```
+
 ---
 
 ### 2. Client 状态管理与数据出口
@@ -82,20 +145,22 @@ const client = builder.build();
 
 #### 强类型事件参考手册 (Type-Safe Event Reference)
 
-`AcpClient` 类通过**严格的 TypeScript 方法重载**重写了 Node 原生的 `EventEmitter` 方法（如 `on`, `once`, `off`）。现代 IDE（如 VS Code）会自动提供事件名拼写补全，并对事件的回调参数（Payload）提供完整的类型校验与结构提示。
+`AcpClient` 类为 Node 原生 `EventEmitter` 的 `emit`、`on` 和 `once` 提供了 TypeScript 方法重载。现代 IDE（如 VS Code）会对这些事件名和回调参数提供补全与类型提示。
 
 以下是客户端支持的完整类型化事件表：
 
-| 事件名称 (Event Name) | 回调参数类型 (Parameter Type)                    | 事件描述                                                   |
-| --------------------- | ------------------------------------------------ | ---------------------------------------------------------- |
-| `stateChange`         | `(newState: ClientState, oldState: ClientState)` | 任何连接状态、会话执行状态发生转换时触发。                 |
-| `event`               | `(event: ConnectionEvent)`                       | 底层连接层收到的所有原始数据包包头包装。                   |
-| `agent_message_chunk` | `(payload: any)`                                 | Agent 流式返回的文本消息 Token 片段。                      |
-| `agent_thought_chunk` | `(payload: any)`                                 | 支持推理思维链的 Agent 正在流式输出的思考 Token 片段。     |
-| `tool_call`           | `(payload: any)`                                 | Agent 请求调用特定的主机/客户端工具/方法。                 |
-| `tool_call_update`    | `(payload: any)`                                 | 被调用的工具执行完成、失败等执行状态更新。                 |
-| `stderr`              | `(payload: any)`                                 | 远端 Agent 进程抛出的原始标准错误诊断输出。                |
-| `permission_request`  | `(payload: any)`                                 | Agent 请求高风险操作（如运行终端脚本）时触发的交互式授权。 |
+| 事件名称 (Event Name) | 回调参数类型 (Parameter Type)                    | 事件描述                                               |
+| --------------------- | ------------------------------------------------ | ------------------------------------------------------ |
+| `stateChange`         | `(newState: ClientState, oldState: ClientState)` | 任何连接状态、会话执行状态发生转换时触发。             |
+| `event`               | `(event: ConnectionEvent)`                       | 底层连接层收到的所有原始数据包包装。                   |
+| `agent_message_chunk` | `(payload: any)`                                 | Agent 流式返回的文本消息 Token 片段。                  |
+| `agentMessage`        | `(payload: any)`                                 | `agent_message_chunk` 的兼容别名。                     |
+| `agent_thought_chunk` | `(payload: any)`                                 | 支持推理思维链的 Agent 正在流式输出的思考 Token 片段。 |
+| `tool_call`           | `(payload: any)`                                 | Agent 请求调用特定的主机/客户端工具/方法。             |
+| `tool_call_update`    | `(payload: any)`                                 | 被调用的工具执行完成、失败等执行状态更新。             |
+| `stderr`              | `(payload: any)`                                 | 远端 Agent 进程抛出的原始标准错误诊断输出。            |
+
+生命周期 hook 事件也通过同一个 `EventEmitter` 暴露，例如 `pre:connect`、`post:initialize`、`pre:prompt` 和 `post:disconnect`。
 
 ```typescript
 // 支持拼写补全与类型校验
@@ -127,9 +192,9 @@ client.on("tool_call", (payload) => {
 
 ---
 
-### 3. ACP 协议扩展 (方法扩展机制)
+### 3. 自定义方法扩展 (MCP Tool Bridge)
 
-要为 Client 增加新的方法/能力，扩展者**完全不需要修改 Client 核心代码**，只需简单 3 步：
+要为 Client 增加新的方法/能力，扩展者**完全不需要修改 Client 核心代码**。配置方法描述、注册处理器后，Client 会把这些方法暴露为 MCP tools，供 ACP Agent 发现和调用。
 
 #### 第一步：在配置文件中描述方法 (`extensions.yaml`)
 
@@ -148,6 +213,7 @@ methods:
 
 ```typescript
 import { ClientMethodHandler } from "acp-client-prototype";
+import { RequestError } from "@agentclientprotocol/sdk";
 
 class MyCustomHandler implements ClientMethodHandler {
   async handle(method: string, params: any): Promise<any> {
@@ -156,10 +222,12 @@ class MyCustomHandler implements ClientMethodHandler {
         greeting: `Hello ${params.name || "User"}, styled using: ${params.style || "plain"}`,
       };
     }
-    throw new Error(`Unsupported custom method: ${method}`);
+    throw RequestError.methodNotFound(method);
   }
 }
 ```
+
+对于 Agent 可见的 client method 或 MCP tool call，如果希望 Agent 看见结构化的 JSON-RPC `code`、`message` 和 `data`，应抛出 ACP SDK 的 `RequestError`。普通 JavaScript `Error` 会在协议边界被视为内部错误。
 
 #### 第三步：使用 Builder 注册
 
@@ -170,23 +238,74 @@ const builder = new AcpClientBuilder()
   .registerExtensionHandler("custom/greet", new MyCustomHandler());
 ```
 
-在 Client 初始化时，这些自定义方法会自动注入到 `clientCapabilities.experimental` 中传输给 Agent，告知其本宿主客户端支持此方法的调用。
+在创建 session 时，Client 会为已配置的扩展方法启动本地 SSE MCP server，并通过 `mcpServers` 传给 Agent。Agent 通过标准 MCP `tools/list` 发现这些方法，通过 `tools/call` 调用。`clientCapabilities.experimental` 仍会作为兼容性元数据发送，但不再依赖它完成工具发现。
+
+可以用扩展方法测试验证这条链路。默认使用 `mock-driver`，也可以传入真实 Agent 标识：
+
+```bash
+pnpm extension-test
+pnpm extension-test <agent-id>
+```
+
+---
+
+### 4. 内置终端 Client Methods
+
+ACP Agent 可以通过标准 `terminal/*` client methods 调用宿主客户端的终端能力：
+
+| 方法                     | 行为                                                   |
+| ------------------------ | ------------------------------------------------------ |
+| `terminal/create`        | 启动本地进程并返回 `terminalId`。                      |
+| `terminal/output`        | 返回已捕获输出、截断状态，以及可用时的退出状态。       |
+| `terminal/wait_for_exit` | 等待进程退出并返回退出状态。                           |
+| `terminal/kill`          | 终止进程，但保留 terminal，供 Agent 继续读取最终输出。 |
+| `terminal/release`       | 释放终端资源，并使对应 `terminalId` 对后续调用失效。   |
+
+`AcpClientBuilder` 默认注册本地 `fs`、`session` 和 `terminal` handler。这些默认实现适合独立运行、样例和本地测试；在更大的 orchestrator/coordinator 中，上层可以替换或包装它们，以实现审计、策略控制、远程执行，或由协调层托管资源生命周期：
+
+```typescript
+const client = new AcpClientBuilder()
+  .withAgent("gemini")
+  .withFileSystemHandler(new CoordinatorFileSystemHandler())
+  .withPermissionHandler(new CoordinatorPermissionHandler())
+  .withTerminalHandler(new AuditedTerminalHandler(new TerminalHandler()))
+  .build();
+
+const coordinatorOwnedClient = new AcpClientBuilder()
+  .withAgent("gemini")
+  .registerMethodHandler("fs", new CoordinatorFileSystemHandler())
+  .registerMethodHandler("session", new CoordinatorPermissionHandler())
+  .registerMethodHandler("terminal", new CoordinatorTerminalHandler())
+  .build();
+```
+
+常规替换优先使用 `withFileSystemHandler()`、`withPermissionHandler()` 和 `withTerminalHandler()`。如果上层需要接管任意 client method 前缀或精确方法名，可以使用 `registerMethodHandler(methodNameOrPrefix, handler)`。
+
+可以用终端方法测试验证完整生命周期。默认使用 `mock-driver`，也可以通过参数或 `TERMINAL_TEST_AGENT` 指定真实 Agent：
+
+```bash
+pnpm terminal-test
+pnpm terminal-test <agent-id>
+TERMINAL_TEST_AGENT=gemini pnpm terminal-test
+```
 
 ---
 
 ## 已支持的适配器列表
 
-| Agent 标识    | 连接方式 | 鉴权策略         | 描述                                          |
-| ------------- | -------- | ---------------- | --------------------------------------------- |
-| **gemini**    | `acp`    | `env-auto`       | 通过 `gemini-cli` 连接 Google Gemini          |
-| **claude**    | `acp`    | `none`           | 通过 `claude-agent-acp` 连接 Anthropic Claude |
-| **copilot**   | `acp`    | `none`           | 通过 `@github/copilot` 连接 GitHub Copilot    |
-| **codex**     | `acp`    | `none`           | 通过 `codex-acp` 连接 OpenAI Codex            |
-| **opencode**  | `acp`    | `pre-configured` | 通过 `opencode-ai` 连接 OpenCode AI           |
-| **goose**     | `acp`    | `pre-configured` | 通过 `goose` 连接 Block/Square Goose AI       |
-| **kiro**      | `acp`    | `pre-configured` | 通过 `kiro-cli` 连接 AWS Kiro AI              |
-| **codebuddy** | `acp`    | `env-auto`       | 通过 `codebuddy-code` 连接腾讯 CodeBuddy      |
-| **aider**     | `pty`    | `pre-configured` | 通过 PTY 伪终端兜底连接 AI 编码助手 Aider     |
+| Agent 标识      | 连接方式 | 鉴权策略         | 描述                                          |
+| --------------- | -------- | ---------------- | --------------------------------------------- |
+| **gemini**      | `acp`    | `auto`           | 通过 `gemini-cli` 连接 Google Gemini          |
+| **claude**      | `acp`    | `auto`           | 通过 `claude-agent-acp` 连接 Anthropic Claude |
+| **copilot**     | `acp`    | `none`           | 通过 `@github/copilot` 连接 GitHub Copilot    |
+| **codex**       | `acp`    | `auto`           | 通过 `codex-acp` 连接 OpenAI Codex            |
+| **kimi**        | `acp`    | `auto`           | 通过 `kimi-code` 连接 Moonshot Kimi Code      |
+| **opencode**    | `acp`    | `pre-configured` | 通过 `opencode-ai` 连接 OpenCode AI           |
+| **goose**       | `acp`    | `pre-configured` | 通过 `goose` 连接 Block/Square Goose AI       |
+| **kiro**        | `acp`    | `pre-configured` | 通过 `kiro-cli` 连接 AWS Kiro AI              |
+| **codebuddy**   | `acp`    | `auto`           | 通过 `codebuddy-code` 连接腾讯 CodeBuddy      |
+| **aider**       | `pty`    | `pre-configured` | 通过 PTY 伪终端兜底连接 AI 编码助手 Aider     |
+| **mock-driver** | `acp`    | `none`           | 测试默认使用的本地 ACP mock driver            |
 
 ---
 
@@ -194,18 +313,21 @@ const builder = new AcpClientBuilder()
 
 ```
 src/
-├── adapter/          # Agent 定义、差异抹平及扩展注册表
 ├── auth/             # 统一鉴权策略（自动、交互、预配置等）
 ├── client/           # Builder 模式实现与 Client 核心生命周期编排器
 ├── client-methods/   # 宿主内置功能 (FS 沙箱、虚拟终端等) 与自定义扩展处理器
 ├── connection/       # 底层连接驱动（ACP JSON-RPC / PTY）
 ├── core/             # 通用错误、类型定义及协议规范定义
 ├── driver/           # A方向 Driver 包装层 (MockDriver)
+├── driver-adapter/   # Agent 定义、差异抹平及扩展注册表
 ├── hook-gate/        # 事件点位定义与拦截回调契约 (解耦)
 └── session/          # 会话存储与管理
 tests/
-├── driver.test.ts    # A方向 Driver 契约集成测试层
-└── hello.ts          # 分离出的独立测试层
+├── driver.test.ts              # A方向 Driver 契约集成测试层
+├── extension-method.test.ts    # 基于 MCP 的扩展方法集成测试
+├── file-handler.test.ts        # 文件系统 client method 集成测试
+├── terminal-method.test.ts     # 终端 client method 生命周期集成测试
+└── hello.ts                    # 分离出的独立测试层
 ```
 
 ---
@@ -219,8 +341,32 @@ tests/
 执行独立的 A 方向驱动集成测试契约套件：
 
 ```bash
-npm run build && npm run build:test && node dist/tests/driver.test.js
+pnpm run build
+pnpm run build:test
+node dist/tests/driver.test.js
 ```
+
+#### 冷启动分段埋点（`driver.phase`）
+
+一次驱动调用的生命周期从外部无法拆分，因此 runner 会在保留审计通道（stderr 上以
+`NEWIDE_DRIVER_EVENT` 为前缀的行）成对发出 `driver.phase` 事件，供上层做耗时归因：
+
+| `payload.phase` | 覆盖范围                                            |
+| --------------- | --------------------------------------------------- |
+| `initialize`    | ACP 初始化握手                                      |
+| `authenticate`  | 凭据解析与认证                                      |
+| `session`       | 会话创建或加载；`payload.mode` 为 `create` / `load` |
+| `shutdown`      | 连接与子进程收尾                                    |
+
+约定：
+
+- 每段先发 `boundary: "started"`，再发 `boundary: "completed"`；**失败同样发 completed**，
+  带 `ok: false` 与 `error`。上层关闭埋点的逻辑因此无条件、无分支。
+- 信封里的 `created_at` 是本进程墙钟，`sequence` 保证同一 turn 内全序。
+- 这是**跨仓库契约**：`newide-scaffold` 的 `CommandDriverTransport` 按这些段名开闭
+  `driver.<phase>` 耗时 span，改名必须两侧同时改。
+- `spawn`、首个输出、进程退出不在表中——它们发生在 ACP 进程之外或之后，由 transport
+  侧自行计时。
 
 ---
 
@@ -232,6 +378,7 @@ npm run build && npm run build:test && node dist/tests/driver.test.js
 | ---------------------- | -------------------------------------------------------------------------- |
 | `VERBOSE=1`            | 开启详细的调试与状态转移日志                                               |
 | `AUTO_APPROVE=1`       | 自动批准所有 Agent 对文件系统、终端操作的授权请求                          |
+| `TERMINAL_TEST_AGENT`  | 覆盖 `pnpm terminal-test` 使用的 Agent；默认使用 `mock-driver`             |
 | `CODEX_HOME`           | 指向自定义目录以覆盖全局 Codex 配置 (例如 `./.codex`)                      |
 | `OPENCODE_CONFIG`      | 指向自定义 JSON 配置文件以覆盖全局 OpenCode 配置 (例如 `./.opencode.json`) |
 | `GOOSE_PATH_ROOT`      | 指向自定义目录以隔离/沙箱化 Goose 的配置、状态和数据目录 (例如 `./.goose`) |

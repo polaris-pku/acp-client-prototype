@@ -10,3 +10,11 @@ export interface AuthStrategy {
   readonly type: AuthStrategyType;
   execute(authMethods: any[], verbose?: boolean): Promise<AuthCredential | null>;
 }
+
+export interface AuthExecutor {
+  execute(
+    strategyType: AuthStrategyType,
+    authMethods: any[],
+    verbose?: boolean
+  ): Promise<AuthCredential | null>;
+}

@@ -1,11 +1,11 @@
-import { AuthStrategy, AuthCredential, AuthStrategyType } from "./interface.js";
+import { AuthExecutor, AuthStrategy, AuthCredential, AuthStrategyType } from "./interface.js";
 import { NoneStrategy, PreConfiguredStrategy } from "./strategies/simple-strategies.js";
 import { EnvAutoStrategy } from "./strategies/env-auto-strategy.js";
 import { InteractiveStrategy } from "./strategies/interactive-strategy.js";
 import { AutoStrategy } from "./strategies/auto-strategy.js";
 import { AuthError } from "../core/errors.js";
 
-export class AuthLayer {
+export class AuthLayer implements AuthExecutor {
   private strategies = new Map<AuthStrategyType, AuthStrategy>();
 
   constructor() {

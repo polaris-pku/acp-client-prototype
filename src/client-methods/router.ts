@@ -1,4 +1,5 @@
 import { ClientMethodHandler } from "./interface.js";
+import { methodNotFound } from "./error-utils.js";
 
 export class ClientMethodRouter {
   private handlers = new Map<string, ClientMethodHandler>();
@@ -19,7 +20,7 @@ export class ClientMethodRouter {
     }
 
     if (!handler) {
-      throw new Error(`No handler registered for method: ${method}`);
+      throw methodNotFound(method);
     }
 
     return await handler.handle(method, params);

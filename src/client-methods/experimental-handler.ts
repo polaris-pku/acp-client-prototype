@@ -1,4 +1,5 @@
 import { ClientMethodHandler } from "./interface.js";
+import { methodNotFound } from "./error-utils.js";
 
 export class ExperimentalHandler implements ClientMethodHandler {
   async handle(method: string, params: any): Promise<any> {
@@ -8,7 +9,7 @@ export class ExperimentalHandler implements ClientMethodHandler {
       case "experimental/status":
         return { status: "ok", timestamp: new Date().toISOString() };
       default:
-        throw new Error(`Unsupported experimental method: ${method}`);
+        throw methodNotFound(method);
     }
   }
 }

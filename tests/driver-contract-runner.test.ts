@@ -3,6 +3,20 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test } from "node:test";
 
+interface DriverEventEnvelope {
+  event_type: string;
+  sequence: number;
+  payload?: Record<string, unknown>;
+}
+
+/** 解析保留审计通道上的 driver 事件；非事件行（诊断输出）被丢弃。 */
+function readDriverEvents(stderr: string): DriverEventEnvelope[] {
+  return stderr
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("NEWIDE_DRIVER_EVENT "))
+    .map((line) => JSON.parse(line.slice("NEWIDE_DRIVER_EVENT ".length)));
+}
+
 test("driver contract runner maps stdin DriverPrompt to stdout DriverRunResult JSON", () => {
   const prompt = {
     task_id: "task-contract-smoke",
@@ -38,7 +52,6 @@ test("driver contract runner maps stdin DriverPrompt to stdout DriverRunResult J
   assert.ok(Array.isArray(parsed.artifacts));
   assert.ok(Array.isArray(parsed.tool_events));
 });
-
 test("driver contract runner loads an existing session and returns response and artifact content", () => {
   const prompt = {
     task_id: "task-contract-session",
@@ -69,7 +82,7 @@ test("driver contract runner loads an existing session and returns response and 
   assert.match(parsed.response, /continued existing-session-id/i);
   assert.equal(parsed.artifacts.length, 1);
   assert.equal(parsed.artifacts[0].content.kind, "text");
-  assert.equal(parsed.artifacts[0].content.target_path, "generated/session.txt");
+  assert.equal(parsed.artifacts[0].content.target_path, join("generated", "session.txt"));
   assert.match(parsed.artifacts[0].content.content_ref, /^data:text\/plain/);
 });
 
@@ -106,4 +119,276 @@ test("driver contract runner emits ACP events on the reserved audit channel", ()
   assert.equal(firstEvent.run_id, prompt.run_id);
   assert.ok(firstEvent.event_type);
   assert.doesNotThrow(() => JSON.parse(result.stdout));
+});
+test("driver contract runner rejects non-array mcp_servers", () => {
+  const prompt = {
+    task_id: "task-contract-mcp-bad",
+    run_id: "run-contract-mcp-bad",
+    prompt: "Say hello.",
+    mcp_servers: "not-an-array",
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "mock-driver",
+      ACP_WORKSPACE: process.cwd(),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /mcp_servers must be an array/i);
+});
+
+test("driver contract runner accepts valid mcp_servers array", () => {
+  const prompt = {
+    task_id: "task-contract-mcp-ok",
+    run_id: "run-contract-mcp-ok",
+    prompt: "Say hello.",
+    mcp_servers: [
+      { name: "test-server", command: "node", args: ["-e", "console.log(1)"], env: [] },
+    ],
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "mock-driver",
+      ACP_WORKSPACE: process.cwd(),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotThrow(() => JSON.parse(result.stdout));
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.status, "succeeded");
+});
+
+test("driver contract runner marks each cold-start phase with a paired driver.phase event", () => {
+  const prompt = {
+    task_id: "task-contract-phases",
+    run_id: "run-contract-phases",
+    prompt: "Say hello from the phase mark test.",
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "mock-driver",
+      ACP_WORKSPACE: process.cwd(),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const events = readDriverEvents(result.stderr);
+  const phases = events.filter((event) => event.event_type === "driver.phase");
+
+  // 成对且有序：每段先 started 后 completed。失败路径同样成对（completed + ok:false），
+  // 所以这里能断言精确序列，而不必容忍缺项。
+  assert.deepEqual(
+    phases.map((event) => `${String(event.payload?.phase)}:${String(event.payload?.boundary)}`),
+    [
+      "initialize:started",
+      "initialize:completed",
+      "authenticate:started",
+      "authenticate:completed",
+      "session:started",
+      "session:completed",
+      "shutdown:started",
+      "shutdown:completed",
+    ]
+  );
+  assert.ok(
+    phases.every((event) => event.payload?.boundary === "started" || event.payload?.ok === true),
+    result.stderr
+  );
+  // sequence 是这条通道的全序，但分段之间夹着 turn 事件，所以只保证严格递增，
+  // 不保证连续——用连续性去断言会误伤正确实现。
+  const sequences = events.map((event) => event.sequence);
+  assert.deepEqual(
+    sequences,
+    [...sequences].sort((left, right) => left - right),
+    result.stderr
+  );
+  assert.equal(new Set(sequences).size, sequences.length, result.stderr);
+
+  // 分段必须把 turn 夹在中间：transport 侧靠 session:completed 关闭握手埋点，
+  // 靠 shutdown:started 起算关停埋点；顺序错了整条时间线就归错段。
+  const timeline = events.map((event) =>
+    event.event_type === "driver.phase"
+      ? `phase:${String(event.payload?.phase)}:${String(event.payload?.boundary)}`
+      : event.event_type
+  );
+  const turnStarted = timeline.indexOf("driver.turn_started");
+  assert.ok(turnStarted > timeline.indexOf("phase:session:completed"), result.stderr);
+  assert.ok(turnStarted < timeline.indexOf("phase:shutdown:started"), result.stderr);
+
+  const sessionStarted = phases.find((event) => event.payload?.phase === "session");
+  assert.equal(sessionStarted?.payload?.mode, "create");
+});
+
+test("driver contract runner pairs a failed phase with ok:false and still returns a result", () => {
+  const prompt = {
+    task_id: "task-contract-phase-failure",
+    run_id: "run-contract-phase-failure",
+    prompt: "This prompt must never reach the agent.",
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "claude",
+      // 用必然不存在的可执行文件替换 agent 命令行，确定性触发 initialize 失败。
+      CLAUDE_CLI_COMMAND: join(process.cwd(), "dist", "__no_such_agent_binary__"),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  // 阶段失败不等于进程崩溃：失败同样要收束成一份可归因的 DriverRunResult，
+  // 而不是让调用方只看到「退出码非零 + 空 stdout」。
+  assert.notEqual(result.status, 0);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.status, "failed");
+  assert.ok(parsed.error);
+
+  const phases = readDriverEvents(result.stderr).filter(
+    (event) => event.event_type === "driver.phase"
+  );
+  // 失败要 fail-fast：initialize 挂掉后不再进 authenticate / session，只补一段收尾。
+  assert.deepEqual(
+    phases.map((event) => `${String(event.payload?.phase)}:${String(event.payload?.boundary)}`),
+    ["initialize:started", "initialize:completed", "shutdown:started", "shutdown:completed"]
+  );
+  // 关键：失败的那一段成对收尾并带 ok:false，上层关闭埋点因此不需要分支。
+  assert.equal(phases[1]?.payload?.ok, false, result.stderr);
+  assert.ok(phases[1]?.payload?.error, result.stderr);
+});
+
+test("driver contract runner marks a resumed session as mode=load", () => {
+  const prompt = {
+    task_id: "task-contract-phase-load",
+    run_id: "run-contract-phase-load",
+    session_id: "existing-session-id",
+    workspace_path: process.cwd(),
+    prompt: "Continue session and report the phase mode.",
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "mock-driver",
+      ACP_WORKSPACE: process.cwd(),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const sessionStarted = readDriverEvents(result.stderr).find(
+    (event) => event.event_type === "driver.phase" && event.payload?.phase === "session"
+  );
+  assert.equal(sessionStarted?.payload?.mode, "load");
+});
+
+test("driver contract runner passes PromptResponse.usage through as snake_case", () => {
+  const prompt = {
+    task_id: "task-contract-usage",
+    run_id: "run-contract-usage",
+    prompt: "Say hello so the default path reports usage.",
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "mock-driver",
+      ACP_WORKSPACE: process.cwd(),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  assert.deepEqual(parsed.usage, {
+    total_tokens: 30,
+    input_tokens: 20,
+    output_tokens: 10,
+    cached_read_tokens: 5,
+  });
+  // 协议里缺省的可选项不补零：「没有这个数据」与「用了 0 个」是不同的信号。
+  assert.equal("thought_tokens" in parsed.usage, false);
+  assert.equal("cached_write_tokens" in parsed.usage, false);
+});
+
+test("driver contract runner retains tool kind and locations on tool_events", () => {
+  const prompt = {
+    task_id: "task-contract-tool-detail",
+    run_id: "run-contract-tool-detail",
+    session_id: "existing-session-id",
+    workspace_path: process.cwd(),
+    prompt: "Continue session and update the generated file.",
+    created_at: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+    schema_version: "v0",
+  };
+
+  const result = spawnSync("node", [join(process.cwd(), "dist/src/driver/contract-runner.js")], {
+    cwd: process.cwd(),
+    input: JSON.stringify(prompt),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACP_AGENT_ID: "mock-driver",
+      ACP_WORKSPACE: process.cwd(),
+      AUTO_APPROVE: "1",
+      VERBOSE: "0",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const parsed = JSON.parse(result.stdout);
+  const write = parsed.tool_events.find(
+    (event: { tool_event_id: string }) => event.tool_event_id === "mock-session-write"
+  );
+  assert.ok(write, "expected the mock session-write tool event");
+  // kind 是分类，与 tool_name（当前由 kind 顶替）并存，供消费方自行降级。
+  assert.equal(write.kind, "edit");
+  // 原样透传 agent 上报的路径，不做归一化——消费方按自己的沙箱根去解释。
+  assert.deepEqual(write.locations, ["generated/session.txt"]);
 });

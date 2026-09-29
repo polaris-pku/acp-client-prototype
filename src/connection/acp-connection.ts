@@ -1,4 +1,4 @@
-import { ClientSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
+import { ClientSideConnection, ndJsonStream, RequestError } from "@agentclientprotocol/sdk";
 import type { Client, SessionNotification } from "@agentclientprotocol/sdk";
 import spawn from "cross-spawn";
 import { spawnSync, type ChildProcess } from "node:child_process";
@@ -13,7 +13,7 @@ import {
   TurnController,
 } from "./interface.js";
 import { AgentSpawnError, TransportError } from "../core/errors.js";
-import type { ClientCapabilities } from "../core/types.js";
+import type { ClientCapabilities, McpServerConfig } from "../core/types.js";
 import {
   processSandboxEnabled,
   resolveProcessSandboxRoot,
@@ -124,25 +124,31 @@ export class AcpConnection implements AgentConnection {
         this.emitEvent(updateType as any, params);
       },
       requestPermission: async (params) => {
-        if (this.methodRouter)
-          return await this.methodRouter.route("session/request_permission", params);
-        this.emitEvent("permission_request", params);
-        return { outcome: "denied" };
+        return await this.routeClientMethod("session/request_permission", params);
       },
       readTextFile: async (params) => {
-        if (this.methodRouter) return await this.methodRouter.route("fs/read_text_file", params);
-        this.emitEvent("fs/read_text_file" as any, params);
-        return { content: "" };
+        return await this.routeClientMethod("fs/read_text_file", params);
       },
       writeTextFile: async (params) => {
-        if (this.methodRouter) return await this.methodRouter.route("fs/write_text_file", params);
-        this.emitEvent("fs/write_text_file" as any, params);
-        return {};
+        return await this.routeClientMethod("fs/write_text_file", params);
       },
       createTerminal: async (params) => {
-        if (this.methodRouter) return await this.methodRouter.route("terminal/create", params);
-        this.emitEvent("terminal/create" as any, params);
-        return { terminalId: "term_stub" };
+        return await this.routeClientMethod("terminal/create", params);
+      },
+      terminalOutput: async (params) => {
+        return await this.routeClientMethod("terminal/output", params);
+      },
+      waitForTerminalExit: async (params) => {
+        return await this.routeClientMethod("terminal/wait_for_exit", params);
+      },
+      killTerminal: async (params) => {
+        return await this.routeClientMethod("terminal/kill", params);
+      },
+      releaseTerminal: async (params) => {
+        return await this.routeClientMethod("terminal/release", params);
+      },
+      extMethod: async (method: string, params: Record<string, unknown>) => {
+        return await this.routeClientMethod(method, params);
       },
     };
 
@@ -161,6 +167,14 @@ export class AcpConnection implements AgentConnection {
   private emitEvent(type: ConnectionEvent["type"], payload: any) {
     const event: ConnectionEvent = { type, payload };
     this.eventEmitter.emit("event", event);
+  }
+
+  private async routeClientMethod(method: string, params: any): Promise<any> {
+    if (!this.methodRouter) {
+      throw RequestError.methodNotFound(method);
+    }
+
+    return await this.methodRouter.route(method, params);
   }
 
   async disconnect(): Promise<void> {
@@ -198,15 +212,19 @@ export class AcpConnection implements AgentConnection {
     await this.sdkConn.authenticate({ methodId, authMethod });
   }
 
-  async createSession(cwd: string): Promise<SessionRecord> {
+  async createSession(cwd: string, mcpServers: McpServerConfig[] = []): Promise<SessionRecord> {
     if (!this.sdkConn) throw new TransportError("Not connected");
-    const resp = await this.sdkConn.newSession({ cwd, mcpServers: [] });
+    const resp = await this.sdkConn.newSession({ cwd, mcpServers });
     return { sessionId: resp.sessionId };
   }
 
-  async loadSession(sessionId: string, cwd: string): Promise<SessionRecord> {
+  async loadSession(
+    sessionId: string,
+    cwd: string,
+    mcpServers: McpServerConfig[] = []
+  ): Promise<SessionRecord> {
     if (!this.sdkConn) throw new TransportError("Not connected");
-    await this.sdkConn.loadSession({ sessionId, cwd, mcpServers: [] });
+    await this.sdkConn.loadSession({ sessionId, cwd, mcpServers });
     return { sessionId };
   }
 
@@ -226,9 +244,14 @@ export class AcpConnection implements AgentConnection {
     await this.sdkConn.cancel({ sessionId });
   }
 
-  async *onEvent(): AsyncIterable<ConnectionEvent> {
-    for await (const [event] of on(this.eventEmitter, "event")) {
-      yield event as ConnectionEvent;
+  async *onEvent(signal?: AbortSignal): AsyncIterable<ConnectionEvent> {
+    try {
+      for await (const [event] of on(this.eventEmitter, "event", { signal })) {
+        yield event as ConnectionEvent;
+      }
+    } catch (err: any) {
+      if (err?.name === "AbortError") return;
+      throw err;
     }
   }
 }

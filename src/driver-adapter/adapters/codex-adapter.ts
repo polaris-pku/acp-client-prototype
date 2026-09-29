@@ -15,5 +15,6 @@ export class CodexAdapter extends BaseAdapter {
         OPENAI_API_KEY: "openai-api-key",
       }
     );
+    this.localLaunch = { packageName: "@zed-industries/codex-acp", args: [] };
   }
 }

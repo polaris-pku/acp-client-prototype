@@ -32,6 +32,12 @@ export class SessionError extends AcpError {
   }
 }
 
+export class ConfigurationError extends AcpError {
+  constructor(message: string, data?: unknown) {
+    super(message, "CONFIGURATION_ERROR", data);
+  }
+}
+
 export class PermissionDeniedError extends AcpError {
   constructor(message: string, data?: unknown) {
     super(message, "PERMISSION_DENIED", data);

@@ -1,5 +1,6 @@
 import { ConnectionType } from "../connection/interface.js";
 import { AuthStrategyType } from "../auth/interface.js";
+import type { PtyOutputParser } from "../connection/pty-parser.js";
 
 export interface AgentAdapter {
   readonly agentId: string;
@@ -19,5 +20,5 @@ export interface AgentAdapter {
   authEnvMap?: Record<string, string>;
 
   // PTY specific
-  parsePtyOutput?(chunk: string): any[];
+  createPtyParser?(): PtyOutputParser | undefined;
 }

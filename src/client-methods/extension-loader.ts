@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { ConfigurationError } from "../core/errors.js";
 
 export interface ExtensionMethod {
   name: string;
@@ -8,15 +9,30 @@ export interface ExtensionMethod {
 
 export function loadExtensionConfig(configPath: string): ExtensionMethod[] {
   if (!fs.existsSync(configPath)) {
-    throw new Error(`Extension config file not found: ${configPath}`);
+    throw new ConfigurationError(`Extension config file not found: ${configPath}`, {
+      configPath,
+    });
   }
   const content = fs.readFileSync(configPath, "utf-8");
-  if (configPath.endsWith(".json")) {
-    const parsed = JSON.parse(content);
-    return parsed.methods || parsed;
-  } else {
-    return parseSimpleYaml(content);
+  try {
+    const methods = configPath.endsWith(".json")
+      ? parseJsonExtensionConfig(content)
+      : parseSimpleYaml(content);
+    return validateExtensionMethods(methods, configPath);
+  } catch (err) {
+    if (err instanceof ConfigurationError) {
+      throw err;
+    }
+    throw new ConfigurationError(
+      `Failed to load extension config ${configPath}: ${err instanceof Error ? err.message : String(err)}`,
+      { configPath }
+    );
   }
+}
+
+function parseJsonExtensionConfig(content: string): ExtensionMethod[] {
+  const parsed = JSON.parse(content);
+  return parsed.methods || parsed;
 }
 
 function parseSimpleYaml(content: string): ExtensionMethod[] {
@@ -88,4 +104,55 @@ function parseKeyValue(line: string, target: any) {
     .replace(/^['"]|['"]$/g, "");
   if (key === "name") target.name = value;
   else if (key === "description") target.description = value;
+}
+
+function validateExtensionMethods(methods: unknown, configPath: string): ExtensionMethod[] {
+  if (!Array.isArray(methods)) {
+    throw new ConfigurationError("Extension config must contain a methods array", {
+      configPath,
+      methods,
+    });
+  }
+
+  const seen = new Set<string>();
+  return methods.map((method, index) => {
+    if (!method || typeof method !== "object") {
+      throw new ConfigurationError("Extension method entry must be an object", {
+        configPath,
+        index,
+        method,
+      });
+    }
+
+    const candidate = method as Partial<ExtensionMethod>;
+    if (typeof candidate.name !== "string" || candidate.name.length === 0) {
+      throw new ConfigurationError("Extension method entry requires a non-empty name", {
+        configPath,
+        index,
+      });
+    }
+
+    if (seen.has(candidate.name)) {
+      throw new ConfigurationError(`Duplicate extension method: ${candidate.name}`, {
+        configPath,
+        index,
+        name: candidate.name,
+      });
+    }
+    seen.add(candidate.name);
+
+    if (typeof candidate.description !== "string" || candidate.description.length === 0) {
+      throw new ConfigurationError("Extension method entry requires a non-empty description", {
+        configPath,
+        index,
+        name: candidate.name,
+      });
+    }
+
+    return {
+      name: candidate.name,
+      description: candidate.description,
+      params: candidate.params,
+    };
+  });
 }

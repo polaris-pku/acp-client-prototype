@@ -1,0 +1,5 @@
+methods:
+  - name: "call_success"
+    description: "Mark the extension method integration test as successful"
+    params:
+      token: "string"

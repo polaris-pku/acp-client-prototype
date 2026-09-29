@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import { AcpClientBuilder, ADAPTER_REGISTRY } from "../src/index.js";
+import { RequestError } from "@agentclientprotocol/sdk";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -147,15 +148,15 @@ async function main(): Promise<void> {
     // --- TEST 3: SECURITY OUT OF BOUNDS PROTECTION ---
     console.log("\n[4/5] Testing Filesystem Directory Safety Boundaries...");
     // Let's attempt to read a file outside the base sandbox directory (e.g., "../package.json")
-    // The FileSystemHandler should block this with a PermissionDeniedError.
+    // The FileSystemHandler should block this with an ACP-visible JSON-RPC error.
     const methodRouter = (client as any).methodRouter;
     if (methodRouter) {
       console.log("Verifying read safety directly on method router...");
       try {
         await methodRouter.route("fs/read_text_file", { path: "../package.json" });
         throw new Error("FAIL: Directory traversal read was not blocked!");
-      } catch (err: any) {
-        if (err.message.includes("Access denied")) {
+      } catch (err) {
+        if (isPermissionDeniedRequestError(err)) {
           console.log(`      ✓ Direct read traversal correctly blocked: ${err.message}`);
         } else {
           throw err;
@@ -169,8 +170,8 @@ async function main(): Promise<void> {
           content: "evil",
         });
         throw new Error("FAIL: Directory traversal write was not blocked!");
-      } catch (err: any) {
-        if (err.message.includes("Access denied")) {
+      } catch (err) {
+        if (isPermissionDeniedRequestError(err)) {
           console.log(`      ✓ Direct write traversal correctly blocked: ${err.message}`);
         } else {
           throw err;
@@ -212,6 +213,12 @@ async function main(): Promise<void> {
     }
     await client.shutdown();
   }
+}
+
+function isPermissionDeniedRequestError(err: unknown): err is RequestError {
+  return (
+    err instanceof RequestError && err.code === -32003 && err.message.includes("Access denied")
+  );
 }
 
 main().catch((err) => {

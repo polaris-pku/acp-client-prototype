@@ -15,6 +15,7 @@ export class GeminiAdapter extends BaseAdapter {
         GOOGLE_CLOUD_PROJECT: "vertex-ai",
       }
     );
+    this.localLaunch = { packageName: "@google/gemini-cli", args: ["--acp"] };
   }
 
   override normalizeResponse(method: string, raw: any): any {

@@ -22,10 +22,15 @@ Powered by `@agentclientprotocol/sdk`.
 
 ## Quick Start
 
+### 0. Prerequisites
+
+- Node.js `>=22.22.1`
+- pnpm `>=11.8.0`
+
 ### 1. Install dependencies
 
 ```bash
-npm install
+pnpm install
 ```
 
 ### 2. Configure credentials
@@ -38,7 +43,7 @@ cp .env.example .env
 ### 3. Run Separated Integration Test
 
 ```bash
-npm run hello -- gemini "Hello World"
+pnpm hello gemini "Hello World"
 ```
 
 ---
@@ -63,6 +68,70 @@ const builder = new AcpClientBuilder()
 const client = builder.build();
 ```
 
+#### Public API Surface
+
+Upper-layer integrations should import extension contracts from the package root instead of
+internal source paths:
+
+```typescript
+import {
+  AcpClientBuilder,
+  ClientMethodHandler,
+  ClientMethodRouter,
+  AgentConnection,
+  AgentAdapter,
+  AuthExecutor,
+  SessionManager,
+  PtyOutputParser,
+  ClientCapabilities,
+  McpServerConfig,
+} from "acp-client-prototype";
+```
+
+The root export is organized around stable integration points:
+
+| Category               | Public exports                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Client construction    | `AcpClientBuilder`, `AcpClient`, `AcpClientOptions`, `ConnectionFactory`                                     |
+| Method handling        | `ClientMethodHandler`, `ClientMethodRouter`, `ExtensionMethod`, `loadExtensionConfig`                        |
+| Default local handlers | `FileSystemHandler`, `PermissionHandler`, `TerminalHandler`, `TerminalHandlerOptions`                        |
+| Connection extension   | `AgentConnection`, `ConnectionEvent`, `TurnController`, `AcpConnection`, `PtyConnection`                     |
+| Adapter extension      | `AgentAdapter`, `ADAPTER_REGISTRY`                                                                           |
+| Auth/session extension | `AuthExecutor`, `AuthLayer`, `SessionManager`, `MemorySessionStore`                                          |
+| PTY parser extension   | `PtyOutputParser`, `PtyParserContext`, `DefaultPtyParser`, `AiderPtyParser`                                  |
+| Protocol types         | `ClientCapabilities`, `McpServerConfig`, `SessionNotification`, `ToolCallUpdate`, and related ACP data types |
+
+Implementation details such as the extension MCP server internals and private parser helpers are intentionally not part of the public root API.
+
+#### Client Method Routing Policy
+
+`AcpClientBuilder` always installs a `ClientMethodRouter` before the connection is used. If an
+upper layer constructs an `AcpConnection` directly, it must call `setMethodRouter(...)` before
+allowing an ACP agent to invoke client methods. Missing routers or missing handlers fail fast;
+the connection does not return stub file, permission, terminal, or extension method results.
+
+For production integration, the bundled handlers and stores are defaults only. Upper-layer
+orchestrators can replace the method handlers, auth executor, session manager, or transport
+connection during construction:
+
+```typescript
+import { AcpClientBuilder, ClientMethodRouter } from "acp-client-prototype";
+
+const methodRouter = new ClientMethodRouter();
+methodRouter.register("custom/audit", new AuditHandler());
+
+const client = new AcpClientBuilder()
+  .withAgent("gemini")
+  .withFileSystemHandler(new CoordinatorFileSystemHandler())
+  .withPermissionHandler(new CoordinatorPermissionHandler())
+  .withTerminalHandler(new RemoteTerminalHandler())
+  .withMethodRouter(methodRouter)
+  .withAuthLayer(new CoordinatorAuthLayer())
+  .withSessionManager(new PersistentSessionManager())
+  .withConnectionFactory((adapter) => createObservedConnection(adapter))
+  .build();
+```
+
 ---
 
 ### 2. Client States & Events
@@ -82,7 +151,7 @@ The client transitions through the following states, queryable via `client.getSt
 
 #### Type-Safe Event Reference
 
-The `AcpClient` class extends Node's `EventEmitter` with **strictly typed method overrides** (`on`, `once`, `off`). Modern IDEs (like VS Code) will automatically provide full autocomplete and type validation for both event names and their payload objects.
+The `AcpClient` class extends Node's `EventEmitter` with typed overrides for `emit`, `on`, and `once`. Modern IDEs (like VS Code) will automatically provide autocomplete and type validation for these event names and payload objects.
 
 Below is the complete registry of typed events emitted by the client:
 
@@ -91,11 +160,14 @@ Below is the complete registry of typed events emitted by the client:
 | `stateChange`         | `(newState: ClientState, oldState: ClientState)` | Triggered on any connection or execution state transition.                   |
 | `event`               | `(event: ConnectionEvent)`                       | Raw, unmodified wrapper for any packet coming from the connection.           |
 | `agent_message_chunk` | `(payload: any)`                                 | Live textual answer tokens streamed from the Agent.                          |
+| `agentMessage`        | `(payload: any)`                                 | Compatibility alias emitted for `agent_message_chunk`.                       |
 | `agent_thought_chunk` | `(payload: any)`                                 | Live thinking process tokens streamed from reasoning-capable Agents.         |
 | `tool_call`           | `(payload: any)`                                 | Signals that the Agent wants to invoke a specific client/client method/tool. |
 | `tool_call_update`    | `(payload: any)`                                 | Signals the execution result status of a requested tool call.                |
 | `stderr`              | `(payload: any)`                                 | Raw standard error diagnostics emitted by the underlying Agent process.      |
-| `permission_request`  | `(payload: any)`                                 | Raised when an Agent requests permission to run interactive commands.        |
+
+Lifecycle hook events such as `pre:connect`, `post:initialize`, `pre:prompt`, and
+`post:disconnect` are also emitted through the same `EventEmitter` interface.
 
 ```typescript
 // Strict autocompleted subscription
@@ -127,9 +199,9 @@ client.on("tool_call", (payload) => {
 
 ---
 
-### 3. Custom Method Capabilities (Extensibility Configuration)
+### 3. Custom Method Capabilities (MCP Tool Bridge)
 
-You can easily extend client capabilities without altering the core codebase. This is done by specifying a configuration file and registering a corresponding handler.
+You can extend client capabilities without altering the core codebase. Define the custom method in a configuration file, register a handler, and the client exposes it to ACP agents as an MCP tool.
 
 #### 1. Define Method Descriptions (`extensions.yaml`)
 
@@ -148,6 +220,7 @@ Write a custom class implementing `ClientMethodHandler`:
 
 ```typescript
 import { ClientMethodHandler } from "acp-client-prototype";
+import { RequestError } from "@agentclientprotocol/sdk";
 
 class MyCustomHandler implements ClientMethodHandler {
   async handle(method: string, params: any): Promise<any> {
@@ -156,10 +229,14 @@ class MyCustomHandler implements ClientMethodHandler {
         greeting: `Hello ${params.name || "User"}, styled using: ${params.style || "plain"}`,
       };
     }
-    throw new Error(`Unsupported custom method: ${method}`);
+    throw RequestError.methodNotFound(method);
   }
 }
 ```
+
+For Agent-visible client methods and MCP tool calls, throw ACP SDK `RequestError`
+instances when you need the Agent to see structured JSON-RPC `code`, `message`, and
+`data`. Plain JavaScript errors are treated as internal failures by the protocol boundary.
 
 #### 3. Register Custom Capabilities
 
@@ -170,23 +247,74 @@ const builder = new AcpClientBuilder()
   .registerExtensionHandler("custom/greet", new MyCustomHandler());
 ```
 
-During client initialization, custom capabilities are packed and sent inside `clientCapabilities.experimental`, telling the AI Agent how to invoke these new capabilities.
+When a session is created, the client starts a local SSE MCP server for the configured extension methods and passes it through `mcpServers`. Agents discover these methods through standard MCP `tools/list` and invoke them through `tools/call`. The legacy `clientCapabilities.experimental` declaration is still sent as metadata, but it is not relied on for tool discovery.
+
+To verify this path, run the extension method test. It uses `mock-driver` by default and accepts a real agent id when needed:
+
+```bash
+pnpm extension-test
+pnpm extension-test <agent-id>
+```
+
+---
+
+### 4. Built-in Terminal Client Methods
+
+ACP agents can call the client's terminal capability through the standard `terminal/*` client methods:
+
+| Method                   | Behavior                                                                 |
+| ------------------------ | ------------------------------------------------------------------------ |
+| `terminal/create`        | Starts a local process and returns a `terminalId`.                       |
+| `terminal/output`        | Returns captured output, truncation state, and exit status when present. |
+| `terminal/wait_for_exit` | Waits for the process to exit and returns its exit status.               |
+| `terminal/kill`          | Terminates the process while keeping the terminal available for output.  |
+| `terminal/release`       | Frees terminal resources and invalidates the `terminalId`.               |
+
+`AcpClientBuilder` registers local default handlers for `fs`, `session`, and `terminal`. These defaults are useful for standalone tests and local development. Upper-layer orchestrators can replace or wrap them for auditing, policy checks, remote execution, or coordinator-owned resource management:
+
+```typescript
+const client = new AcpClientBuilder()
+  .withAgent("gemini")
+  .withFileSystemHandler(new CoordinatorFileSystemHandler())
+  .withPermissionHandler(new CoordinatorPermissionHandler())
+  .withTerminalHandler(new AuditedTerminalHandler(new TerminalHandler()))
+  .build();
+
+const coordinatorOwnedClient = new AcpClientBuilder()
+  .withAgent("gemini")
+  .registerMethodHandler("fs", new CoordinatorFileSystemHandler())
+  .registerMethodHandler("session", new CoordinatorPermissionHandler())
+  .registerMethodHandler("terminal", new CoordinatorTerminalHandler())
+  .build();
+```
+
+Use the dedicated `withFileSystemHandler()`, `withPermissionHandler()`, and `withTerminalHandler()` methods for common replacement paths. Use `registerMethodHandler(methodNameOrPrefix, handler)` when a coordinator needs to own any client method prefix or exact method name.
+
+To verify the terminal lifecycle, run the terminal method test. It uses `mock-driver` by default and can target a real agent with an argument or `TERMINAL_TEST_AGENT`:
+
+```bash
+pnpm terminal-test
+pnpm terminal-test <agent-id>
+TERMINAL_TEST_AGENT=gemini pnpm terminal-test
+```
 
 ---
 
 ## Supported Adapters
 
-| Agent         | Connection | Auth Strategy    | Description                             |
-| ------------- | ---------- | ---------------- | --------------------------------------- |
-| **gemini**    | `acp`      | `env-auto`       | Google Gemini via `gemini-cli`          |
-| **claude**    | `acp`      | `none`           | Anthropic Claude via `claude-agent-acp` |
-| **copilot**   | `acp`      | `none`           | GitHub Copilot via `@github/copilot`    |
-| **codex**     | `acp`      | `none`           | OpenAI Codex via `codex-acp`            |
-| **opencode**  | `acp`      | `pre-configured` | OpenCode AI via `opencode-ai`           |
-| **goose**     | `acp`      | `pre-configured` | Block/Square Goose via `goose`          |
-| **kiro**      | `acp`      | `pre-configured` | AWS Kiro AI via `kiro-cli`              |
-| **codebuddy** | `acp`      | `env-auto`       | Tencent CodeBuddy via `codebuddy-code`  |
-| **aider**     | `pty`      | `pre-configured` | AI coding assistant via PTY fallback    |
+| Agent           | Connection | Auth Strategy    | Description                             |
+| --------------- | ---------- | ---------------- | --------------------------------------- |
+| **gemini**      | `acp`      | `auto`           | Google Gemini via `gemini-cli`          |
+| **claude**      | `acp`      | `auto`           | Anthropic Claude via `claude-agent-acp` |
+| **copilot**     | `acp`      | `none`           | GitHub Copilot via `@github/copilot`    |
+| **codex**       | `acp`      | `auto`           | OpenAI Codex via `codex-acp`            |
+| **kimi**        | `acp`      | `auto`           | Moonshot Kimi Code via `kimi-code`      |
+| **opencode**    | `acp`      | `pre-configured` | OpenCode AI via `opencode-ai`           |
+| **goose**       | `acp`      | `pre-configured` | Block/Square Goose via `goose`          |
+| **kiro**        | `acp`      | `pre-configured` | AWS Kiro AI via `kiro-cli`              |
+| **codebuddy**   | `acp`      | `auto`           | Tencent CodeBuddy via `codebuddy-code`  |
+| **aider**       | `pty`      | `pre-configured` | AI coding assistant via PTY fallback    |
+| **mock-driver** | `acp`      | `none`           | Local ACP mock driver used by tests     |
 
 ---
 
@@ -194,18 +322,21 @@ During client initialization, custom capabilities are packed and sent inside `cl
 
 ```
 src/
-├── adapter/          # Agent definitions, quirks, & extensible registry
 ├── auth/             # Environment-auto, interactive, pre-configured strategies
 ├── client/           # Builder pattern, AcpClient lifecycle orchestrator
 ├── client-methods/   # Standard (FS, Terminal, Session) & Custom Extensions
 ├── connection/       # Protocol drivers (JSON-RPC / PTY abstraction)
 ├── core/             # Errors, shared types, ACP schemas
 ├── driver/           # Direction A Driver Wrapper layer (MockDriver)
+├── driver-adapter/   # Agent definitions, quirks, and extensible registry
 ├── hook-gate/        # Event schemas & interceptor callbacks (Decoupled)
 └── session/          # Session cache & store
 tests/
-├── driver.test.ts    # Direction A Driver contract integration tests
-└── hello.ts          # Separated testing layer
+├── driver.test.ts              # Direction A Driver contract integration tests
+├── extension-method.test.ts    # MCP-backed extension method integration test
+├── file-handler.test.ts        # Filesystem client method integration test
+├── terminal-method.test.ts     # Terminal client method lifecycle integration test
+└── hello.ts                    # Separated testing layer
 ```
 
 ---
@@ -219,8 +350,36 @@ To support end-to-end multi-agent BCD pipelines, the micro-level `AcpClient` is 
 To run the standalone driver test suite:
 
 ```bash
-npm run build && npm run build:test && node dist/tests/driver.test.js
+pnpm run build
+pnpm run build:test
+node dist/tests/driver.test.js
 ```
+
+#### Cold-start phase marks (`driver.phase`)
+
+A driver invocation's lifecycle cannot be split from the outside, so the runner emits paired
+`driver.phase` events on the reserved audit channel (stderr lines prefixed with
+`NEWIDE_DRIVER_EVENT`) for upper layers to attribute time against:
+
+| `payload.phase` | Covers                                                      |
+| --------------- | ----------------------------------------------------------- |
+| `initialize`    | ACP initialize handshake                                    |
+| `authenticate`  | Credential resolution and authentication                    |
+| `session`       | Session creation or load; `payload.mode` is `create`/`load` |
+| `shutdown`      | Connection and child-process teardown                       |
+
+Contract:
+
+- Each phase emits `boundary: "started"`, then `boundary: "completed"`. **Failures also emit
+  completed**, carrying `ok: false` and `error`, so consumers close a phase unconditionally
+  without branching.
+- The envelope's `created_at` is this process's wall clock; `sequence` totally orders events
+  within one turn.
+- This is a **cross-repository contract**: `CommandDriverTransport` in `newide-scaffold` opens
+  and closes `driver.<phase>` latency spans from these phase names. Renaming requires changing
+  both sides.
+- `spawn`, first output, and process exit are deliberately absent — they happen outside or after
+  the ACP process, so the transport times them locally.
 
 ---
 
@@ -232,6 +391,7 @@ npm run build && npm run build:test && node dist/tests/driver.test.js
 | ---------------------- | ------------------------------------------------------------------------------------------------ |
 | `VERBOSE=1`            | Enable detailed debug logging and state outputs                                                  |
 | `AUTO_APPROVE=1`       | Automatically approve all agent filesystem & terminal requests                                   |
+| `TERMINAL_TEST_AGENT`  | Override the agent used by `pnpm terminal-test`; defaults to `mock-driver`                       |
 | `CODEX_HOME`           | Point to a custom directory to override global Codex configuration (e.g., `./.codex`)            |
 | `OPENCODE_CONFIG`      | Point to a custom JSON configuration file to override OpenCode config (e.g., `./.opencode.json`) |
 | `GOOSE_PATH_ROOT`      | Point to a custom folder to sandbox Goose configuration, state, and data (e.g., `./.goose`)      |

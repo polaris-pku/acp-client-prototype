@@ -4,18 +4,37 @@ dotenv.config();
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { AcpClientBuilder } from "../client/builder.js";
-import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from "../core/types.js";
+import {
+  SCHEMA_VERSION,
+  createId,
+  nowTimestamp,
+  type ArtifactRef,
+  type McpServerConfig,
+  type ToolKind,
+} from "../core/types.js";
 import type { ConnectionEvent, TurnController } from "../connection/interface.js";
 import type {
   DriverPrompt,
   DriverRunResult,
   DriverRunStatus,
   DriverToolEvent,
+  DriverUsage,
 } from "./interface.js";
 
 const DRIVER_EVENT_PREFIX = "NEWIDE_DRIVER_EVENT ";
 const DRIVER_EVENT_SCHEMA_VERSION = "driver-event.v1";
 
+/**
+ * `driver.phase` 事件携带的段名闭集。
+ *
+ * 这是**跨仓库契约**：newide-scaffold 的 CommandDriverTransport 按这些名字开/闭
+ * `driver.<phase>` 的耗时埋点。改这里的字面量等于改契约，两边必须同时改。
+ *
+ * 只登记驱动调用内部、从外部观测不到的段。spawn、首个输出、以及进程退出
+ * （cleanup）发生在 ACP 进程之外或之后，由 transport 侧自行计时，不在此重复；
+ * prompt / turn 已由既有的 driver.turn_started / turn_completed 覆盖。
+ */
+type DriverPhase = "initialize" | "authenticate" | "session" | "shutdown";
 interface RunOptions {
   agentId: string;
   workspace: string;
@@ -71,12 +90,18 @@ function parseDriverPrompt(raw: string): DriverPrompt {
     throw new Error("DriverPrompt.context_pack_ref must be an object when provided.");
   }
 
+  if (parsed.mcp_servers !== undefined && !Array.isArray(parsed.mcp_servers)) {
+    throw new Error("DriverPrompt.mcp_servers must be an array when provided.");
+  }
   return {
     task_id: parsed.task_id as string,
     run_id: parsed.run_id as string,
     prompt: parsed.prompt as string,
     session_id: parsed.session_id as string | undefined,
     workspace_path: parsed.workspace_path as string | undefined,
+    mcp_servers: Array.isArray(parsed.mcp_servers)
+      ? (parsed.mcp_servers as McpServerConfig[])
+      : undefined,
     context_pack_ref: parsed.context_pack_ref as DriverPrompt["context_pack_ref"],
     created_at: typeof parsed.created_at === "string" ? parsed.created_at : nowTimestamp(),
     schema_version:
@@ -115,33 +140,96 @@ async function runContractPrompt(
     }
   };
 
+  /**
+   * 包住一个冷启动阶段，成对发 driver.phase 的 started / completed。
+   *
+   * 失败也发 completed（带 `ok: false` 与错误摘要），而不是另发一条 failed：
+   * transport 侧关闭埋点的逻辑因此无条件、无分支；而且「这一段花了多久才失败」
+   * 本身正是失败归因需要的数据。
+   *
+   * 固定字段写在 `...meta` 之后，保证 meta 覆盖不掉 phase / boundary / ok。
+   */
+  const runPhase = async <T>(
+    phase: DriverPhase,
+    meta: Record<string, unknown>,
+    run: () => Promise<T>
+  ): Promise<T> => {
+    emitDriverEvent("driver.phase", { ...meta, phase, boundary: "started" });
+    try {
+      const value = await run();
+      emitDriverEvent("driver.phase", { ...meta, phase, boundary: "completed", ok: true });
+      return value;
+    } catch (error) {
+      emitDriverEvent("driver.phase", {
+        ...meta,
+        phase,
+        boundary: "completed",
+        ok: false,
+        error: errorMessage(error),
+      });
+      throw error;
+    }
+  };
+
   try {
-    client = new AcpClientBuilder()
+    // 先落到 const：闭包里要用到收窄后的类型，而外层 `client` 只留给 finally 收尾。
+    const acpClient = new AcpClientBuilder()
       .withAgent(options.agentId)
       .withVerbose(false)
       .withAutoApprove(process.env.AUTO_APPROVE === "1")
       .withSandboxDir(workspace)
       .build();
+    client = acpClient;
 
-    await client.initialize();
-    await client.authenticate();
+    await runPhase("initialize", {}, () => acpClient.initialize());
+    await runPhase("authenticate", {}, () => acpClient.authenticate());
 
-    const session = input.session_id
-      ? await client.loadSession(input.session_id, workspace)
-      : await client.createSession(workspace);
+    const mcpServers = input.mcp_servers ?? [];
+
+    // create 与 load 的成本形态不同（load 要重放历史），而是否复用会话正是本次
+    // 归因要回答的问题之一，所以用 meta.mode 而不是拆成两个段名。
+    const sessionMode = input.session_id ? "load" : "create";
+    const session = await runPhase("session", { mode: sessionMode }, () =>
+      input.session_id
+        ? acpClient.loadSession(input.session_id, workspace, mcpServers)
+        : acpClient.createSession(workspace, mcpServers)
+    );
     sessionId = session.sessionId;
     emitDriverEvent("driver.turn_started", { prompt_length: input.prompt.length });
 
+    // ── Signal handling: capture signals that arrive during sendPrompt ──
+    let pendingCancel = false;
+    const earlySignalHandler = () => {
+      pendingCancel = true;
+    };
+    process.once("SIGTERM", earlySignalHandler);
+    process.once("SIGINT", earlySignalHandler);
+
     const turn = await client.sendPrompt(input.prompt);
-    onTerminate = (): void => {
+
+    // Clean up early handlers (no-op if already fired via once)
+    process.removeListener("SIGTERM", earlySignalHandler);
+    process.removeListener("SIGINT", earlySignalHandler);
+
+    if (pendingCancel) {
+      // Signal arrived during sendPrompt — cancel immediately
       cancelRequested = true;
       emitDriverEvent("driver.turn_cancel_requested", { reason: "process_signal" });
       void turn.cancel().catch((cancelError) => {
         emitDriverEvent("driver.turn_cancel_failed", { error: errorMessage(cancelError) });
       });
-    };
-    process.once("SIGTERM", onTerminate);
-    process.once("SIGINT", onTerminate);
+    } else {
+      // Register handlers for signals during turn execution
+      onTerminate = (): void => {
+        cancelRequested = true;
+        emitDriverEvent("driver.turn_cancel_requested", { reason: "process_signal" });
+        void turn.cancel().catch((cancelError) => {
+          emitDriverEvent("driver.turn_cancel_failed", { error: errorMessage(cancelError) });
+        });
+      };
+      process.once("SIGTERM", onTerminate);
+      process.once("SIGINT", onTerminate);
+    }
 
     const collectEvents = collectTurnEvents(turn, events, (event) => {
       emitDriverEvent(event.type, event.payload);
@@ -185,9 +273,10 @@ async function runContractPrompt(
       process.removeListener("SIGTERM", onTerminate);
       process.removeListener("SIGINT", onTerminate);
     }
-    if (client) {
+    const closing = client;
+    if (closing) {
       try {
-        await client.shutdown();
+        await runPhase("shutdown", {}, () => closing.shutdown());
       } catch (shutdownError) {
         process.stderr.write(`[driver:run] shutdown failed: ${errorMessage(shutdownError)}\n`);
       }
@@ -215,6 +304,7 @@ function buildRunResult(params: ResultBuildInput): DriverRunResult {
   const status = mapRunStatus(stopReason, params.error, params.cancelRequested);
   const error = buildDriverError(status, stopReason, params.error);
   const transcriptStats = summarizeTranscript(params.events);
+  const usage = usageFrom(params.promptResult);
 
   return {
     driver_run_result_id: createId("driver_result"),
@@ -247,6 +337,7 @@ function buildRunResult(params: ResultBuildInput): DriverRunResult {
       schema_version: schemaVersion,
     },
     tool_events: collectToolEvents(params.events, createdAt, schemaVersion),
+    ...(usage ? { usage } : {}),
     diagnostics: {
       driver_id: params.agentId,
       duration_ms: Math.max(0, Date.now() - params.startedAtMs),
@@ -274,6 +365,7 @@ function collectToolEvents(
         tool_name: stringValue(update.kind) || stringValue(update.title) || "tool_call",
         status: normalizeToolStatus(update.status),
         summary: stringValue(update.title) || "ACP tool call started.",
+        ...toolDetail(update),
         created_at: createdAt,
         schema_version: schemaVersion,
       });
@@ -283,11 +375,17 @@ function collectToolEvents(
       const update = updateRecord(event);
       const id = stringValue(update.toolCallId) || createId("tool_event");
       const existing = byId.get(id);
+      // 部分更新只带变化字段，所以 kind / locations 要叠加到已有值上，不能整体覆盖。
+      const detail = toolDetail(update);
+      const kind = detail.kind ?? existing?.kind;
+      const locations = mergeLocationPaths(existing?.locations, detail.locations);
       byId.set(id, {
         tool_event_id: id,
         tool_name: existing?.tool_name || "tool_call",
         status: normalizeToolStatus(update.status),
         summary: summarizeToolUpdate(update, existing),
+        ...(kind ? { kind } : {}),
+        ...(locations ? { locations } : {}),
         created_at: existing?.created_at || createdAt,
         schema_version: schemaVersion,
       });
@@ -477,6 +575,88 @@ function summarizeToolUpdate(update: Record<string, unknown>, existing?: DriverT
   return existing?.summary || "ACP tool call updated.";
 }
 
+/** 协议定义的 kind 闭集。协议外的取值一律丢弃，不把脏值写进契约。 */
+const TOOL_KINDS: readonly string[] = [
+  "read",
+  "edit",
+  "delete",
+  "move",
+  "search",
+  "execute",
+  "think",
+  "fetch",
+  "switch_mode",
+  "other",
+];
+
+/**
+ * 从一次 tool_call / tool_call_update 里取 `kind` 与 `locations`。
+ *
+ * `tool_call_update` 是部分更新——只带变化字段，所以两者都可能缺席，
+ * 调用方需要把结果叠加到已有值上而不是整体替换。
+ */
+function toolDetail(update: Record<string, unknown>): {
+  kind?: ToolKind;
+  locations?: string[];
+} {
+  const rawKind = stringValue(update.kind);
+  const kind = rawKind && TOOL_KINDS.includes(rawKind) ? (rawKind as ToolKind) : undefined;
+  const locations = locationPaths(update);
+  return {
+    ...(kind ? { kind } : {}),
+    ...(locations.length ? { locations } : {}),
+  };
+}
+
+function locationPaths(update: Record<string, unknown>): string[] {
+  const locations = update.locations;
+  if (!Array.isArray(locations)) return [];
+  return locations
+    .map((item) => (isRecord(item) ? stringValue(item.path) : undefined))
+    .filter((path): path is string => path !== undefined);
+}
+
+/** 并集去重且保序（先已有、后新增）：同一次工具调用会在多条更新里重复上报同一路径。 */
+function mergeLocationPaths(
+  existing: string[] | undefined,
+  incoming: string[] | undefined
+): string[] | undefined {
+  const merged = [...new Set([...(existing ?? []), ...(incoming ?? [])])];
+  return merged.length ? merged : undefined;
+}
+
+/**
+ * 从 `PromptResponse.usage` 取本轮 token 用量。
+ *
+ * 协议整体标 UNSTABLE 且 usage 本身可选，所以数据不全时返回 undefined 而不是补零——
+ * 「没有这个数据」和「用了 0 个 token」对下游是不同的信号。
+ */
+function usageFrom(promptResult: unknown): DriverUsage | undefined {
+  if (!isRecord(promptResult)) return undefined;
+  const usage = promptResult.usage;
+  if (!isRecord(usage)) return undefined;
+
+  const totalTokens = numberValue(usage.totalTokens);
+  const inputTokens = numberValue(usage.inputTokens);
+  const outputTokens = numberValue(usage.outputTokens);
+  // 三个必填项缺一不可：缺了就不是一份可用的用量报告。
+  if (totalTokens === undefined || inputTokens === undefined || outputTokens === undefined) {
+    return undefined;
+  }
+
+  const thoughtTokens = numberValue(usage.thoughtTokens);
+  const cachedReadTokens = numberValue(usage.cachedReadTokens);
+  const cachedWriteTokens = numberValue(usage.cachedWriteTokens);
+
+  return {
+    total_tokens: totalTokens,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    ...(thoughtTokens !== undefined ? { thought_tokens: thoughtTokens } : {}),
+    ...(cachedReadTokens !== undefined ? { cached_read_tokens: cachedReadTokens } : {}),
+    ...(cachedWriteTokens !== undefined ? { cached_write_tokens: cachedWriteTokens } : {}),
+  };
+}
 function textFromContent(content: unknown): string {
   if (!isRecord(content)) return "";
   return stringValue(content.text) || "";
@@ -495,6 +675,10 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/** 只认有限数值：NaN / Infinity 经 JSON 往返会变成 null，不如在这里就挡掉。 */
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

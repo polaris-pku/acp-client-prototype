@@ -14,5 +14,7 @@ export class KimiAdapter extends BaseAdapter {
         MOONSHOT_API_KEY: "terminal", // Fallback mapping if they support API keys
       }
     );
+    // 该包不在本仓库依赖里，正常情况下解析不到，会按预期退回 npx。
+    this.localLaunch = { packageName: "@moonshot-ai/kimi-code", args: ["acp"] };
   }
 }
