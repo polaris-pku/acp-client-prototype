@@ -18,7 +18,14 @@ export interface AgentAdapter {
   readonly connectionType: ConnectionType;
 
   resolveCommand(): LaunchCommand;
-  /** 解析结果连同来源。探针据此填 `provenance`，不靠比对命令字符串猜。 */
+  /**
+   * 解析结果连同来源。探针据此填 `provenance`，不靠比对命令字符串猜。
+   *
+   * @remarks
+   * 基类的兜底分支把「三条通道都没命中」判成 `path`，前提是默认命令为 PATH 上的
+   * 可执行名。默认命令是启动器加脚本路径的（如 `node dist/.../mock-driver.js`），
+   * 必须自行实现本方法声明来源，否则会被静默报成 `path`。
+   */
   resolveLaunch(): { launch: LaunchCommand; provenance: LaunchProvenance };
   resolveEnv(): Record<string, string | undefined>;
   resolveAuthStrategy(): AuthStrategyType;
