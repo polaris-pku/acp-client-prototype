@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { BaseAdapter } from "../base-adapter.js";
+import type { LaunchCommand, LaunchProvenance } from "../interface.js";
 
 export class KiroAdapter extends BaseAdapter {
   constructor() {
@@ -15,19 +16,19 @@ export class KiroAdapter extends BaseAdapter {
     );
   }
 
-  override resolveCommand(): { command: string; args: string[] } {
-    const resolved = super.resolveCommand();
+  override resolveLaunch(): { launch: LaunchCommand; provenance: LaunchProvenance } {
+    const resolved = super.resolveLaunch();
 
     // On Windows, if kiro-cli isn't in Node's current PATH
     // we attempt to resolve its standard absolute installation path.
-    if (resolved.command === "kiro-cli") {
+    if (resolved.launch.command === "kiro-cli") {
       const localAppData =
         process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Local");
       const fallbackPath = path.join(localAppData, "Kiro-Cli", "kiro-cli.exe");
       if (existsSync(fallbackPath)) {
         return {
-          command: fallbackPath,
-          args: resolved.args,
+          launch: { command: fallbackPath, args: resolved.launch.args },
+          provenance: resolved.provenance,
         };
       }
     }
