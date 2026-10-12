@@ -1,6 +1,7 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import type { LaunchProvenance } from "./interface.js";
 
 /**
  * 一个 adapter 的「本地已安装入口」说明。
@@ -32,6 +33,33 @@ const requireFromHere = createRequire(import.meta.url);
 const cache = new Map<string, ResolvedLaunch | null>();
 
 /**
+ * 探测跑通的入口，按 agentId 钉住。
+ *
+ * 探测与建连必须发同一条命令。建连侧的解析缓存只在进程生命周期内有效，
+ * 而探测可能发生在另一个进程（配置页）里，所以结论要显式钉住。
+ */
+const pins = new Map<string, { launch: ResolvedLaunch; provenance: LaunchProvenance }>();
+
+export function pinResolvedLaunch(
+  agentId: string,
+  launch: ResolvedLaunch,
+  provenance: LaunchProvenance
+): void {
+  pins.set(agentId, { launch: { command: launch.command, args: [...launch.args] }, provenance });
+}
+
+export function pinnedLaunch(
+  agentId: string
+): { launch: ResolvedLaunch; provenance: LaunchProvenance } | undefined {
+  return pins.get(agentId);
+}
+
+export function clearPinnedLaunch(agentId?: string): void {
+  if (agentId === undefined) pins.clear();
+  else pins.delete(agentId);
+}
+
+/**
  * 把 spec 解析成可直接 spawn 的 `{ command, args }`。
  *
  * 任何一步不成立都返回 `undefined`（调用方据此退回 npx），**不抛异常**：
@@ -45,6 +73,11 @@ export function resolveLocalLaunch(spec: LocalLaunchSpec): ResolvedLaunch | unde
   const resolved = computeLocalLaunch(spec);
   cache.set(key, resolved ?? null);
   return resolved;
+}
+
+/** 忘掉已解析的结果，下次调用重新解析。用于探测结论失效后的重新探测。 */
+export function clearResolvedLaunchCache(): void {
+  cache.clear();
 }
 
 function computeLocalLaunch(spec: LocalLaunchSpec): ResolvedLaunch | undefined {
